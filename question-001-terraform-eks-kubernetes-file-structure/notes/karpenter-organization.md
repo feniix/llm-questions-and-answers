@@ -3,6 +3,7 @@
 ## The Circular Dependency Challenge
 
 **The Problem:**
+
 - Karpenter controller (application) needs a running EKS cluster
 - NodePools (infrastructure config) need Karpenter controller running  
 - But NodePools define infrastructure that applications depend on
@@ -15,7 +16,7 @@ Bootstrap pattern with layered deployment
 
 ### Approach 1: Four-Layer Architecture (Recommended)
 
-```
+```text
 terraform-eks-platform/
 ├── infrastructure/
 │   ├── networking/
@@ -256,31 +257,36 @@ resource "kubernetes_manifest" "general_nodepool" {
 The key to resolving the circular dependency is the **deployment sequence**:
 
 ### 1. Bootstrap Phase
+
 ```bash
 # Deploy infrastructure with bootstrap nodes
 cd infrastructure/networking && terraform apply
 cd infrastructure/eks-cluster && terraform apply
 ```
 
-### 2. Platform Services Phase  
+### 2. Platform Services Phase
+
 ```bash
 # Deploy Karpenter controller (runs on bootstrap nodes)
 cd platform-services/karpenter-controller && terraform apply
 ```
 
 ### 3. Platform Configuration Phase
+
 ```bash
 # Deploy default NodePools (now Karpenter is running)
 cd platform-configuration/karpenter-nodepools && terraform apply
 ```
 
 ### 4. Application Phase
+
 ```bash
 # Deploy applications (can now use Karpenter nodes)
 cd applications/app-team-alpha && terraform apply
 ```
 
 ### 5. Cleanup Phase (Optional)
+
 ```bash
 # Remove bootstrap nodes once Karpenter is managing nodes
 cd infrastructure/eks-cluster
@@ -291,7 +297,7 @@ terraform apply -var="enable_bootstrap_nodes=false"
 
 If you prefer a simpler approach, you can keep everything in the platform layer:
 
-```
+```text
 terraform-eks-platform/
 ├── infrastructure/
 │   ├── eks-cluster/        # EKS + Bootstrap nodes + Karpenter IAM
