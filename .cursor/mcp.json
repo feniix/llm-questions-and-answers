@@ -32,14 +32,6 @@
         "@upstash/context7-mcp@1.0.17"
       ]
     },
-    "memory": {
-      "type": "stdio",
-      "command": "bunx",
-      "args": [
-        "-y",
-        "@modelcontextprotocol/server-memory@2025.8.4"
-      ]
-    },
     "terraform": {
       "type": "stdio",
       "command": "terraform-mcp-server",
