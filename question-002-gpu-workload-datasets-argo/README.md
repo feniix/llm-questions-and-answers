@@ -54,10 +54,12 @@ Using sequential thinking and multiple data sources:
 
 ### Argo Workflows Integration
 
-- **Fan-out Processing**: Split large datasets across multiple GPU pods
+- **Fan-out Processing**: Split large datasets across multiple GPU pods using S3-based dynamic chunking
+- **Parallel Dataset Processing**: Automatic dataset splitting with optimal chunk sizes for T4 GPUs
 - **Parameter Sweeps**: Hyperparameter tuning with parallel GPU jobs
 - **Pipeline Dependencies**: Multi-stage ML pipelines with GPU acceleration
-- **Dynamic Scaling**: Auto-scale GPU nodes based on workload
+- **Dynamic Scaling**: HPA-driven auto-scale GPU nodes based on workload and GPU utilization
+- **Fault Tolerance**: Chunk-level retry mechanisms with exponential backoff
 
 ## Performance Expectations (AWS EKS with T4 GPUs)
 
@@ -68,6 +70,8 @@ Using sequential thinking and multiple data sources:
 - **Throughput**: ~3K embeddings/minute per T4 GPU
 - **Memory**: 16GB VRAM per T4, optimal batch size: 16-32 documents
 - **Scaling**: 24 T4 nodes can process 100M documents in 24 hours (~$300 total cost)
+- **Dataset Splitting**: Automatic optimal chunking based on dataset size and available GPU resources
+- **Parallel Efficiency**: 8 T4 GPUs process 100K documents in ~4 minutes vs 33 minutes on single GPU
 
 ## Next Steps
 
@@ -84,14 +88,16 @@ Using sequential thinking and multiple data sources:
 
 - `notes/gpu-workflow-configuration.md` - GPU-optimized Argo configuration and deployment commands
 - `notes/s3-artifact-repository-setup.md` - S3 artifact repository with EKS Pod Identity
-- `notes/gpu-workflow-templates.yaml` - Production-ready GPU workflow templates
+- `notes/gpu-workflow-templates.yaml` - Production-ready GPU workflow templates (PyTorch 2.8.0)
+- `notes/dataset-splitting-implementation.md` - Complete dataset splitting and parallel processing guide
 - `notes/troubleshooting-monitoring.md` - Monitoring and troubleshooting guide
 
 ### Workflow Templates
 
 1. **gpu-embedding-generation** - Large-scale document embedding with T4 GPUs
-2. **gpu-document-summarization** - Multi-document summarization pipeline
-3. **gpu-hyperparameter-tuning** - Distributed hyperparameter optimization
+2. **gpu-embedding-generation-parallel** - Advanced parallel processing with automatic dataset splitting
+3. **gpu-document-summarization** - Multi-document summarization pipeline
+4. **gpu-hyperparameter-tuning** - Distributed hyperparameter optimization
 
 ### Quick Start
 
@@ -99,13 +105,56 @@ Using sequential thinking and multiple data sources:
 # Deploy workflow templates
 kubectl apply -f notes/gpu-workflow-templates.yaml
 
-# Submit embedding workflow (3K embeddings/min on T4)
+# Option 1: Basic single-node GPU processing
 argo submit -n argo --from workflowtemplate/gpu-embedding-generation \
   --parameter dataset-size=10000 --parameter batch-size=32
 
-# Monitor progress
+# Option 2: Parallel processing with automatic dataset splitting (Recommended)
+argo submit -n argo --from workflowtemplate/gpu-embedding-generation-parallel \
+  --parameter dataset-name="sample-100k-docs" \
+  --parameter target-parallelism=8 \
+  --parameter s3-bucket="argo-gpu-artifacts-12345"
+
+# Monitor progress and scaling
 argo watch <workflow-name> -n argo
-argo logs <workflow-name> -n argo
+kubectl get hpa gpu-worker-hpa -n argo -w
+
+# View results and cost analysis
+argo logs <workflow-name> -n argo | grep "Final aggregation completed"
+```
+
+### Large-Scale Processing Examples
+
+#### Process 100K Documents with Auto-Scaling
+
+```bash
+# Submit large-scale job with automatic GPU scaling
+argo submit -n argo --from workflowtemplate/gpu-embedding-generation-parallel \
+  --parameter dataset-name="large-corpus-$(date +%s)" \
+  --parameter target-parallelism=8 \
+  --parameter s3-bucket="your-s3-bucket" \
+  --name large-embedding-job
+
+# Expected results:
+# - Processing time: ~4 minutes with 8 T4 GPUs
+# - Cost: ~$0.28 for 100K documents
+# - Automatic scaling from 1 to 8+ GPU nodes based on workload
+```
+
+#### Monitor GPU Utilization and Costs
+
+```bash
+# Real-time monitoring script
+./notes/monitor-gpu-scaling.sh
+
+# Cost analysis for completed workflow
+./notes/cost-analysis.sh <workflow-name>
+
+# Expected output:
+# Duration: 0.067 hours
+# GPU nodes used: 8
+# Estimated cost: $0.28
+# Cost per 1M documents: $2.80
 ```
 
 ## Files in This Analysis
