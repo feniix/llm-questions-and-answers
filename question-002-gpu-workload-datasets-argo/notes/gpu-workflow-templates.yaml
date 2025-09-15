@@ -1,0 +1,850 @@
+# GPU Workflow Templates for T4 Workloads
+# Collection of practical workflow templates for machine learning tasks on T4 GPUs
+
+---
+# 1. Large-Scale Embedding Generation Workflow
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: gpu-embedding-generation
+  namespace: argo
+spec:
+  serviceAccountName: argo-workflows-sa
+  entrypoint: embedding-pipeline
+  arguments:
+    parameters:
+    - name: batch-size
+      value: "32"  # Optimized for T4 16GB VRAM
+    - name: model-name
+      value: "sentence-transformers/all-mpnet-base-v2"
+    - name: dataset-size
+      value: "10000"
+
+  templates:
+  - name: embedding-pipeline
+    dag:
+      tasks:
+      - name: prepare-dataset
+        template: data-preparation
+        arguments:
+          parameters:
+          - name: dataset-size
+            value: "{{workflow.parameters.dataset-size}}"
+
+      - name: generate-embeddings
+        template: gpu-embedding-task
+        dependencies: [prepare-dataset]
+        arguments:
+          parameters:
+          - name: batch-size
+            value: "{{workflow.parameters.batch-size}}"
+          - name: model-name
+            value: "{{workflow.parameters.model-name}}"
+          artifacts:
+          - name: input-data
+            from: "{{tasks.prepare-dataset.outputs.artifacts.dataset}}"
+
+      - name: create-index
+        template: vector-index
+        dependencies: [generate-embeddings]
+        arguments:
+          artifacts:
+          - name: embeddings
+            from: "{{tasks.generate-embeddings.outputs.artifacts.embeddings}}"
+
+  - name: data-preparation
+    inputs:
+      parameters:
+      - name: dataset-size
+    script:
+      image: python:3.9-slim
+      command: [python]
+      resources:
+        requests:
+          memory: 2Gi
+          cpu: 1
+        limits:
+          memory: 4Gi
+          cpu: 2
+      source: |
+        import json
+        import os
+        from datetime import datetime
+
+        dataset_size = int("{{inputs.parameters.dataset-size}}")
+
+        # Sample document generation (replace with actual data loading)
+        documents = [
+            "Kubernetes orchestrates containerized applications across clusters.",
+            "Machine learning models require significant computational resources.",
+            "GPU acceleration improves training and inference performance.",
+            "Argo Workflows enables complex data processing pipelines.",
+            "Cloud computing provides scalable infrastructure solutions.",
+            "Docker containers package applications with their dependencies.",
+            "Natural language processing transforms text into meaningful insights.",
+            "Distributed systems handle large-scale data processing efficiently."
+        ] * (dataset_size // 8 + 1)
+
+        # Truncate to exact size
+        documents = documents[:dataset_size]
+
+        # Create output directory
+        os.makedirs('/tmp/outputs', exist_ok=True)
+
+        # Save dataset
+        dataset = {
+            "documents": documents,
+            "total_count": len(documents),
+            "created_at": datetime.now().isoformat()
+        }
+
+        with open('/tmp/outputs/dataset.json', 'w') as f:
+            json.dump(dataset, f)
+
+        print(f"Prepared dataset with {len(documents)} documents")
+        print(f"Output saved to /tmp/outputs/dataset.json")
+    outputs:
+      artifacts:
+      - name: dataset
+        path: /tmp/outputs/dataset.json
+
+  - name: gpu-embedding-task
+    inputs:
+      parameters:
+      - name: batch-size
+      - name: model-name
+      artifacts:
+      - name: input-data
+        path: /tmp/input/dataset.json
+    outputs:
+      artifacts:
+      - name: embeddings
+        path: /tmp/outputs/embeddings.npy
+      - name: metadata
+        path: /tmp/outputs/metadata.json
+    nodeSelector:
+      node-type: gpu-t4
+    tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+    script:
+      image: pytorch/pytorch:2.1.0-cuda11.8-cudnn8-runtime
+      command: [python]
+      resources:
+        requests:
+          nvidia.com/gpu: 1
+          memory: 8Gi
+          cpu: 4
+        limits:
+          nvidia.com/gpu: 1
+          memory: 14Gi
+          cpu: 6
+      source: |
+        import json
+        import numpy as np
+        import torch
+        import time
+        import os
+        from datetime import datetime
+
+        # Install required packages
+        os.system("pip install transformers sentence-transformers")
+
+        from transformers import AutoTokenizer, AutoModel
+
+        print("=== GPU Embedding Generation ===")
+        print(f"PyTorch version: {torch.__version__}")
+        print(f"CUDA available: {torch.cuda.is_available()}")
+
+        if torch.cuda.is_available():
+            print(f"GPU count: {torch.cuda.device_count()}")
+            print(f"Current GPU: {torch.cuda.current_device()}")
+            print(f"GPU name: {torch.cuda.get_device_name(0)}")
+            print(f"GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+
+        # Parameters
+        batch_size = int("{{inputs.parameters.batch-size}}")
+        model_name = "{{inputs.parameters.model-name}}"
+
+        print(f"Model: {model_name}")
+        print(f"Batch size: {batch_size}")
+
+        # Load model
+        print("Loading model...")
+        start_time = time.time()
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModel.from_pretrained(model_name)
+
+        # Move to GPU
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model.to(device)
+        model.eval()
+        load_time = time.time() - start_time
+        print(f"Model loaded in {load_time:.2f} seconds")
+
+        # Load input data
+        print("Loading dataset...")
+        with open('/tmp/input/dataset.json', 'r') as f:
+            data = json.load(f)
+
+        documents = data['documents']
+        total_docs = len(documents)
+        print(f"Processing {total_docs} documents")
+
+        # Process in batches
+        embeddings = []
+        processing_stats = []
+
+        print("Starting embedding generation...")
+        overall_start = time.time()
+
+        for i in range(0, total_docs, batch_size):
+            batch_start = time.time()
+            batch = documents[i:i+batch_size]
+            current_batch_size = len(batch)
+
+            # Tokenize
+            inputs = tokenizer(batch,
+                             padding=True,
+                             truncation=True,
+                             max_length=512,
+                             return_tensors='pt')
+
+            # Move to GPU
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+
+            # Generate embeddings
+            with torch.no_grad():
+                outputs = model(**inputs)
+                # Mean pooling
+                attention_mask = inputs['attention_mask']
+                token_embeddings = outputs.last_hidden_state
+                input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+                batch_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+
+                embeddings.append(batch_embeddings.cpu().numpy())
+
+            batch_time = time.time() - batch_start
+            throughput = current_batch_size / batch_time
+
+            processing_stats.append({
+                "batch_id": i // batch_size + 1,
+                "batch_size": current_batch_size,
+                "batch_time": batch_time,
+                "throughput": throughput
+            })
+
+            if (i // batch_size + 1) % 10 == 0:
+                print(f"Processed batch {i // batch_size + 1}/{(total_docs + batch_size - 1) // batch_size} "
+                      f"({current_batch_size} docs in {batch_time:.2f}s, {throughput:.1f} docs/sec)")
+                if torch.cuda.is_available():
+                    memory_used = torch.cuda.max_memory_allocated() / 1024**3
+                    print(f"GPU memory used: {memory_used:.2f} GB")
+
+        total_time = time.time() - overall_start
+        overall_throughput = total_docs / total_time
+
+        # Combine all embeddings
+        final_embeddings = np.vstack(embeddings)
+
+        print("=== Processing Complete ===")
+        print(f"Total documents: {total_docs}")
+        print(f"Final embeddings shape: {final_embeddings.shape}")
+        print(f"Total processing time: {total_time:.2f} seconds")
+        print(f"Overall throughput: {overall_throughput:.2f} docs/second")
+        print(f"Embeddings per minute: {overall_throughput * 60:.0f}")
+
+        # Save embeddings and metadata
+        os.makedirs('/tmp/outputs', exist_ok=True)
+
+        np.save('/tmp/outputs/embeddings.npy', final_embeddings)
+
+        metadata = {
+            "model_name": model_name,
+            "total_documents": total_docs,
+            "embedding_dimensions": final_embeddings.shape[1],
+            "batch_size": batch_size,
+            "processing_stats": {
+                "total_time": total_time,
+                "overall_throughput": overall_throughput,
+                "embeddings_per_minute": overall_throughput * 60,
+                "model_load_time": load_time
+            },
+            "batch_stats": processing_stats,
+            "device_info": {
+                "device": str(device),
+                "gpu_available": torch.cuda.is_available(),
+                "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+            },
+            "created_at": datetime.now().isoformat()
+        }
+
+        with open('/tmp/outputs/metadata.json', 'w') as f:
+            json.dump(metadata, f, indent=2)
+
+        print("Output files saved:")
+        print("- /tmp/outputs/embeddings.npy")
+        print("- /tmp/outputs/metadata.json")
+
+  - name: vector-index
+    inputs:
+      artifacts:
+      - name: embeddings
+        path: /tmp/input/embeddings.npy
+    outputs:
+      artifacts:
+      - name: search-index
+        path: /tmp/outputs/search-index.pkl
+    script:
+      image: python:3.9
+      command: [python]
+      resources:
+        requests:
+          memory: 4Gi
+          cpu: 2
+        limits:
+          memory: 8Gi
+          cpu: 4
+      source: |
+        import numpy as np
+        import pickle
+        import os
+        from datetime import datetime
+
+        # Install required packages
+        os.system("pip install faiss-cpu scikit-learn")
+
+        import faiss
+        from sklearn.metrics.pairwise import cosine_similarity
+
+        print("=== Creating Vector Search Index ===")
+
+        # Load embeddings
+        embeddings = np.load('/tmp/input/embeddings.npy')
+        print(f"Loaded embeddings: {embeddings.shape}")
+
+        # Normalize embeddings for cosine similarity
+        normalized_embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
+
+        # Create FAISS index
+        dimension = embeddings.shape[1]
+        index = faiss.IndexFlatIP(dimension)  # Inner Product for normalized vectors = cosine similarity
+        index.add(normalized_embeddings.astype('float32'))
+
+        print(f"Created FAISS index with {index.ntotal} vectors")
+
+        # Test search functionality
+        print("Testing search functionality...")
+        test_query = normalized_embeddings[0:1]  # Use first embedding as test query
+        distances, indices = index.search(test_query, 5)
+
+        print(f"Test search results: {indices[0]}")
+        print(f"Similarity scores: {distances[0]}")
+
+        # Create search index object
+        search_index = {
+            'faiss_index': index,
+            'embeddings': normalized_embeddings,
+            'metadata': {
+                'total_vectors': index.ntotal,
+                'dimension': dimension,
+                'index_type': 'FlatIP',
+                'created_at': datetime.now().isoformat()
+            }
+        }
+
+        # Save index
+        os.makedirs('/tmp/outputs', exist_ok=True)
+        with open('/tmp/outputs/search-index.pkl', 'wb') as f:
+            pickle.dump(search_index, f)
+
+        print("Search index saved to /tmp/outputs/search-index.pkl")
+        print(f"Index contains {index.ntotal} vectors of dimension {dimension}")
+
+---
+# 2. Multi-Document Summarization Workflow
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: gpu-document-summarization
+  namespace: argo
+spec:
+  serviceAccountName: argo-workflows-sa
+  entrypoint: summarization-pipeline
+  arguments:
+    parameters:
+    - name: model-name
+      value: "facebook/bart-large-cnn"
+    - name: max-length
+      value: "150"
+    - name: min-length
+      value: "50"
+    - name: batch-size
+      value: "8"  # Smaller batch for summarization models
+
+  templates:
+  - name: summarization-pipeline
+    dag:
+      tasks:
+      - name: prepare-articles
+        template: article-preparation
+
+      - name: generate-summaries
+        template: gpu-summarization-task
+        dependencies: [prepare-articles]
+        arguments:
+          parameters:
+          - name: model-name
+            value: "{{workflow.parameters.model-name}}"
+          - name: max-length
+            value: "{{workflow.parameters.max-length}}"
+          - name: min-length
+            value: "{{workflow.parameters.min-length}}"
+          - name: batch-size
+            value: "{{workflow.parameters.batch-size}}"
+          artifacts:
+          - name: articles
+            from: "{{tasks.prepare-articles.outputs.artifacts.articles}}"
+
+  - name: article-preparation
+    script:
+      image: python:3.9-slim
+      command: [python]
+      resources:
+        requests:
+          memory: 1Gi
+          cpu: 1
+        limits:
+          memory: 2Gi
+          cpu: 2
+      source: |
+        import json
+        import os
+
+        # Sample articles for summarization
+        articles = [
+            {
+                "id": 1,
+                "title": "Kubernetes in Production",
+                "content": """
+                Kubernetes has become the de facto standard for container orchestration in production environments.
+                Organizations worldwide are adopting Kubernetes to manage their containerized applications at scale.
+                The platform provides automated deployment, scaling, and management of containerized applications.
+                With features like service discovery, load balancing, storage orchestration, and automated rollouts,
+                Kubernetes enables teams to build resilient and scalable applications. However, managing Kubernetes
+                clusters requires careful planning and expertise in areas such as security, networking, and monitoring.
+                Best practices include implementing proper RBAC policies, network policies, resource quotas, and
+                comprehensive monitoring solutions. Many organizations start with managed Kubernetes services like
+                EKS, GKE, or AKS to reduce operational overhead while learning the platform.
+                """
+            },
+            {
+                "id": 2,
+                "title": "GPU Computing in Machine Learning",
+                "content": """
+                Graphics Processing Units (GPUs) have revolutionized machine learning by providing massive parallel
+                computing capabilities. Unlike CPUs with a few cores optimized for sequential processing, GPUs contain
+                thousands of smaller cores designed for parallel operations. This architecture is ideal for the matrix
+                operations common in neural networks. Training deep learning models that once took weeks on CPUs can
+                now be completed in hours or days with GPU acceleration. Popular frameworks like TensorFlow and PyTorch
+                provide built-in GPU support, automatically utilizing CUDA cores for computation. However, effective GPU
+                utilization requires careful consideration of memory management, batch sizing, and data loading patterns.
+                Cloud providers offer various GPU instance types, from cost-effective T4 instances for inference to
+                high-performance V100 and A100 instances for large-scale training workloads.
+                """
+            },
+            {
+                "id": 3,
+                "title": "Argo Workflows for Data Processing",
+                "content": """
+                Argo Workflows is a container-native workflow engine for orchestrating parallel jobs on Kubernetes.
+                It allows data scientists and engineers to define complex multi-step workflows as Kubernetes resources.
+                Each step in the workflow runs in its own container, providing isolation and reproducibility. Argo
+                Workflows supports various workflow patterns including DAGs, loops, conditionals, and recursion.
+                The platform integrates seamlessly with artifact repositories like S3, enabling data to flow between
+                workflow steps. For machine learning pipelines, Argo Workflows can orchestrate data preprocessing,
+                model training, validation, and deployment steps. The visual web interface provides real-time monitoring
+                of workflow execution, making it easy to debug and optimize complex pipelines. Advanced features include
+                parameter sweeps for hyperparameter tuning, retries for handling transient failures, and resource
+                management for optimal cluster utilization.
+                """
+            }
+        ] * 100  # Replicate for larger dataset
+
+        os.makedirs('/tmp/outputs', exist_ok=True)
+        with open('/tmp/outputs/articles.json', 'w') as f:
+            json.dump(articles, f, indent=2)
+
+        print(f"Prepared {len(articles)} articles for summarization")
+
+    outputs:
+      artifacts:
+      - name: articles
+        path: /tmp/outputs/articles.json
+
+  - name: gpu-summarization-task
+    inputs:
+      parameters:
+      - name: model-name
+      - name: max-length
+      - name: min-length
+      - name: batch-size
+      artifacts:
+      - name: articles
+        path: /tmp/input/articles.json
+    outputs:
+      artifacts:
+      - name: summaries
+        path: /tmp/outputs/summaries.json
+    nodeSelector:
+      node-type: gpu-t4
+    tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+    script:
+      image: pytorch/pytorch:2.1.0-cuda11.8-cudnn8-runtime
+      command: [python]
+      resources:
+        requests:
+          nvidia.com/gpu: 1
+          memory: 10Gi
+          cpu: 4
+        limits:
+          nvidia.com/gpu: 1
+          memory: 14Gi
+          cpu: 6
+      source: |
+        import json
+        import torch
+        import time
+        import os
+        from datetime import datetime
+
+        # Install required packages
+        os.system("pip install transformers")
+
+        from transformers import BartTokenizer, BartForConditionalGeneration
+
+        print("=== GPU Document Summarization ===")
+        print(f"PyTorch version: {torch.__version__}")
+        print(f"CUDA available: {torch.cuda.is_available()}")
+
+        if torch.cuda.is_available():
+            print(f"GPU name: {torch.cuda.get_device_name(0)}")
+            print(f"GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+
+        # Parameters
+        model_name = "{{inputs.parameters.model-name}}"
+        max_length = int("{{inputs.parameters.max-length}}")
+        min_length = int("{{inputs.parameters.min-length}}")
+        batch_size = int("{{inputs.parameters.batch-size}}")
+
+        print(f"Model: {model_name}")
+        print(f"Summary length: {min_length}-{max_length} tokens")
+        print(f"Batch size: {batch_size}")
+
+        # Load model
+        print("Loading model...")
+        start_time = time.time()
+        tokenizer = BartTokenizer.from_pretrained(model_name)
+        model = BartForConditionalGeneration.from_pretrained(model_name)
+
+        # Move to GPU
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model.to(device)
+        model.eval()
+        load_time = time.time() - start_time
+        print(f"Model loaded in {load_time:.2f} seconds")
+
+        # Load articles
+        with open('/tmp/input/articles.json', 'r') as f:
+            articles = json.load(f)
+
+        print(f"Processing {len(articles)} articles")
+
+        # Process in batches
+        summaries = []
+        processing_start = time.time()
+
+        for i in range(0, len(articles), batch_size):
+            batch_start = time.time()
+            batch_articles = articles[i:i+batch_size]
+
+            # Prepare batch inputs
+            texts = [article['content'] for article in batch_articles]
+
+            # Tokenize
+            inputs = tokenizer(texts,
+                             max_length=1024,
+                             return_tensors='pt',
+                             padding=True,
+                             truncation=True)
+
+            # Move to GPU
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+
+            # Generate summaries
+            with torch.no_grad():
+                summary_ids = model.generate(
+                    inputs['input_ids'],
+                    attention_mask=inputs['attention_mask'],
+                    max_length=max_length,
+                    min_length=min_length,
+                    length_penalty=2.0,
+                    num_beams=4,
+                    early_stopping=True
+                )
+
+            # Decode summaries
+            batch_summaries = tokenizer.batch_decode(summary_ids, skip_special_tokens=True)
+
+            # Store results
+            for j, (article, summary) in enumerate(zip(batch_articles, batch_summaries)):
+                summaries.append({
+                    "id": article['id'],
+                    "title": article['title'],
+                    "original_length": len(article['content']),
+                    "summary": summary,
+                    "summary_length": len(summary),
+                    "compression_ratio": len(summary) / len(article['content'])
+                })
+
+            batch_time = time.time() - batch_start
+            print(f"Processed batch {i // batch_size + 1}: {len(batch_articles)} articles in {batch_time:.2f}s")
+
+        total_time = time.time() - processing_start
+        throughput = len(articles) / total_time
+
+        print(f"=== Summarization Complete ===")
+        print(f"Total articles: {len(articles)}")
+        print(f"Total processing time: {total_time:.2f} seconds")
+        print(f"Throughput: {throughput:.2f} articles/second")
+
+        # Save results
+        os.makedirs('/tmp/outputs', exist_ok=True)
+
+        results = {
+            "model_name": model_name,
+            "parameters": {
+                "max_length": max_length,
+                "min_length": min_length,
+                "batch_size": batch_size
+            },
+            "statistics": {
+                "total_articles": len(articles),
+                "processing_time": total_time,
+                "throughput": throughput,
+                "average_compression_ratio": sum(s['compression_ratio'] for s in summaries) / len(summaries)
+            },
+            "summaries": summaries,
+            "created_at": datetime.now().isoformat()
+        }
+
+        with open('/tmp/outputs/summaries.json', 'w') as f:
+            json.dump(results, f, indent=2)
+
+        print("Results saved to /tmp/outputs/summaries.json")
+
+---
+# 3. Hyperparameter Tuning Workflow
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: gpu-hyperparameter-tuning
+  namespace: argo
+spec:
+  serviceAccountName: argo-workflows-sa
+  entrypoint: hyperparameter-sweep
+  arguments:
+    parameters:
+    - name: model-type
+      value: "text-classification"
+    - name: max-trials
+      value: "8"
+
+  templates:
+  - name: hyperparameter-sweep
+    steps:
+    - - name: generate-configs
+        template: config-generator
+        arguments:
+          parameters:
+          - name: max-trials
+            value: "{{workflow.parameters.max-trials}}"
+    - - name: train-model
+        template: gpu-training-task
+        arguments:
+          parameters:
+          - name: config
+            value: "{{item}}"
+        withParam: "{{steps.generate-configs.outputs.result}}"
+    - - name: select-best
+        template: model-selection
+        arguments:
+          artifacts:
+          - name: all-results
+            from: "{{steps.train-model.outputs.artifacts.results}}"
+
+  - name: config-generator
+    inputs:
+      parameters:
+      - name: max-trials
+    script:
+      image: python:3.9-slim
+      command: [python]
+      source: |
+        import json
+        import random
+
+        max_trials = int("{{inputs.parameters.max-trials}}")
+
+        # Generate hyperparameter configurations
+        configs = []
+        for i in range(max_trials):
+            config = {
+                "trial_id": i + 1,
+                "learning_rate": round(random.uniform(1e-5, 1e-3), 6),
+                "batch_size": random.choice([16, 24, 32]),
+                "num_epochs": random.choice([3, 5, 8]),
+                "warmup_steps": random.choice([100, 200, 500]),
+                "weight_decay": round(random.uniform(0.01, 0.1), 3)
+            }
+            configs.append(config)
+
+        # Output as JSON string for withParam
+        print(json.dumps(configs))
+
+  - name: gpu-training-task
+    inputs:
+      parameters:
+      - name: config
+    outputs:
+      artifacts:
+      - name: results
+        path: /tmp/outputs/results.json
+    nodeSelector:
+      node-type: gpu-t4
+    tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+    script:
+      image: pytorch/pytorch:2.1.0-cuda11.8-cudnn8-runtime
+      command: [python]
+      resources:
+        requests:
+          nvidia.com/gpu: 1
+          memory: 8Gi
+          cpu: 4
+        limits:
+          nvidia.com/gpu: 1
+          memory: 12Gi
+          cpu: 6
+      source: |
+        import json
+        import torch
+        import time
+        import os
+        from datetime import datetime
+        import random
+        import numpy as np
+
+        # Parse configuration
+        config = json.loads('''{{inputs.parameters.config}}''')
+
+        print(f"=== Training Trial {config['trial_id']} ===")
+        print(f"Configuration: {json.dumps(config, indent=2)}")
+
+        # Simulate training process (replace with actual training code)
+        print("Starting training simulation...")
+        start_time = time.time()
+
+        # Simulate training with some randomness based on hyperparameters
+        base_accuracy = 0.85
+        lr_factor = min(config['learning_rate'] * 10000, 1.0)  # Better with moderate LR
+        batch_factor = min(config['batch_size'] / 32.0, 1.0)   # Better with optimal batch size
+        epoch_factor = min(config['num_epochs'] / 5.0, 1.0)    # Better with more epochs
+
+        # Add some randomness
+        random_factor = random.uniform(0.95, 1.05)
+
+        final_accuracy = base_accuracy * lr_factor * batch_factor * epoch_factor * random_factor
+        final_accuracy = min(final_accuracy, 0.95)  # Cap at 95%
+
+        # Simulate training time
+        training_time = config['num_epochs'] * (config['batch_size'] / 16) * random.uniform(30, 60)
+        time.sleep(min(training_time / 10, 30))  # Simulate (scaled down for demo)
+
+        end_time = time.time()
+        actual_time = end_time - start_time
+
+        # Create results
+        results = {
+            "trial_id": config['trial_id'],
+            "config": config,
+            "results": {
+                "accuracy": round(final_accuracy, 4),
+                "training_time": round(actual_time, 2),
+                "final_loss": round(random.uniform(0.1, 0.5), 4),
+                "convergence_epoch": random.randint(2, config['num_epochs'])
+            },
+            "metadata": {
+                "device": "cuda" if torch.cuda.is_available() else "cpu",
+                "completed_at": datetime.now().isoformat()
+            }
+        }
+
+        print(f"Training completed:")
+        print(f"- Accuracy: {results['results']['accuracy']}")
+        print(f"- Training time: {results['results']['training_time']}s")
+        print(f"- Final loss: {results['results']['final_loss']}")
+
+        # Save results
+        os.makedirs('/tmp/outputs', exist_ok=True)
+        with open('/tmp/outputs/results.json', 'w') as f:
+            json.dump(results, f, indent=2)
+
+  - name: model-selection
+    inputs:
+      artifacts:
+      - name: all-results
+        path: /tmp/input/results
+    script:
+      image: python:3.9-slim
+      command: [python]
+      source: |
+        import json
+        import os
+        import glob
+
+        print("=== Model Selection ===")
+
+        # Collect all results
+        results = []
+        result_files = glob.glob('/tmp/input/results/*.json')
+
+        for file_path in result_files:
+            with open(file_path, 'r') as f:
+                result = json.load(f)
+                results.append(result)
+
+        print(f"Collected {len(results)} trial results")
+
+        # Sort by accuracy (descending)
+        results.sort(key=lambda x: x['results']['accuracy'], reverse=True)
+
+        print("\n=== Top 3 Configurations ===")
+        for i, result in enumerate(results[:3]):
+            print(f"\nRank {i+1} (Trial {result['trial_id']}):")
+            print(f"  Accuracy: {result['results']['accuracy']}")
+            print(f"  Learning Rate: {result['config']['learning_rate']}")
+            print(f"  Batch Size: {result['config']['batch_size']}")
+            print(f"  Epochs: {result['config']['num_epochs']}")
+            print(f"  Training Time: {result['results']['training_time']}s")
+
+        best_config = results[0]
+        print(f"\n=== Best Configuration (Trial {best_config['trial_id']}) ===")
+        print(f"Accuracy: {best_config['results']['accuracy']}")
+        print(f"Config: {json.dumps(best_config['config'], indent=2)}")
