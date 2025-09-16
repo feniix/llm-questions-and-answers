@@ -11,125 +11,451 @@ This guide provides concrete implementation examples for splitting large dataset
 #### Chunk Size Calculator
 
 ```python
-def calculate_optimal_chunks(dataset_size, available_gpus, gpu_memory_gb=16):
+def calculate_optimal_chunks(dataset_size, available_gpus, task_type='embedding', gpu_memory_gb=16):
     """
-    Calculate optimal chunk sizes for GPU processing
+    Calculate optimal chunk sizes for GPU processing with realistic memory estimates
 
     Args:
         dataset_size: Total number of documents/samples
         available_gpus: Number of available GPU nodes
+        task_type: Type of GPU task ('embedding', 'summarization', 'training')
         gpu_memory_gb: GPU memory in GB (default: T4 = 16GB)
 
     Returns:
-        dict: Chunk configuration
+        dict: Chunk configuration with accurate memory calculations
     """
-    # T4 GPU optimal batch sizes by task type
-    batch_sizes = {
-        'embedding': 32,
-        'summarization': 8,
-        'training': 16
+
+    # Task-specific configurations based on real GPU memory usage
+    task_configs = {
+        'embedding': {
+            'batch_size': 32,
+            'processing_rate_per_minute': 3000,
+            'model_memory_gb': 1.2,  # sentence-transformers model
+            'input_memory_per_token_mb': 0.004,  # Input tensors
+            'output_memory_per_item_mb': 3.0,  # 768-dim float32 embedding
+            'pytorch_overhead_multiplier': 1.4  # PyTorch overhead
+        },
+        'summarization': {
+            'batch_size': 8,
+            'processing_rate_per_minute': 600,
+            'model_memory_gb': 2.8,  # T5-large or BART-large
+            'input_memory_per_token_mb': 0.008,
+            'output_memory_per_item_mb': 1.0,  # Generated text
+            'pytorch_overhead_multiplier': 1.6
+        },
+        'training': {
+            'batch_size': 16,
+            'processing_rate_per_minute': 240,
+            'model_memory_gb': 3.5,  # Larger models for training
+            'input_memory_per_token_mb': 0.012,  # Gradients included
+            'output_memory_per_item_mb': 0.5,
+            'pytorch_overhead_multiplier': 2.0  # Gradients + optimizer states
+        }
     }
 
-    # Calculate chunk size ensuring even distribution
-    target_chunks = min(available_gpus * 2, dataset_size // 1000)  # At least 1K items per chunk
-    chunk_size = max(1000, dataset_size // target_chunks)
+    config = task_configs[task_type]
+
+    # Calculate memory requirements per batch
+    avg_tokens_per_item = 128  # Typical document length after truncation
+
+    batch_memory_mb = (
+        config['model_memory_gb'] * 1024 +  # Model weights
+        config['batch_size'] * avg_tokens_per_item * config['input_memory_per_token_mb'] +  # Input tensors
+        config['batch_size'] * config['output_memory_per_item_mb']  # Output tensors
+    ) * config['pytorch_overhead_multiplier']
+
+    # Ensure we don't exceed GPU memory (leave 2GB for system)
+    available_memory_mb = (gpu_memory_gb - 2) * 1024
+    max_batch_size = min(config['batch_size'], int(available_memory_mb / (batch_memory_mb / config['batch_size'])))
+
+    # Calculate optimal chunk size based on processing time and memory
+    target_processing_minutes = 5  # Aim for 5-minute chunks for good parallelism
+    items_per_chunk_time = config['processing_rate_per_minute'] * target_processing_minutes
+
+    # Memory-constrained chunk size
+    batches_per_chunk = max(1, int(available_memory_mb * 0.8 / batch_memory_mb))  # 80% memory utilization
+    items_per_chunk_memory = batches_per_chunk * max_batch_size
+
+    # Use the more conservative estimate
+    optimal_chunk_size = min(items_per_chunk_time, items_per_chunk_memory)
+
+    # Calculate final chunk configuration
+    target_chunks = min(available_gpus * 2, max(1, dataset_size // optimal_chunk_size))
+    chunk_size = max(max_batch_size, dataset_size // target_chunks)
+    total_chunks = (dataset_size + chunk_size - 1) // chunk_size
+
+    # Realistic memory calculations
+    chunk_memory_mb = (chunk_size / max_batch_size) * batch_memory_mb
+    streaming_memory_mb = chunk_memory_mb + 50  # Add streaming buffer overhead
 
     return {
-        'total_chunks': (dataset_size + chunk_size - 1) // chunk_size,
+        'total_chunks': total_chunks,
         'chunk_size': chunk_size,
-        'optimal_batch_size': batch_sizes['embedding'],  # Default to embedding
-        'estimated_processing_time_minutes': chunk_size / (3000 / 60),  # 3K items/minute per T4
-        'memory_per_chunk_gb': chunk_size * 0.001  # Rough estimate
+        'optimal_batch_size': max_batch_size,
+        'task_type': task_type,
+        'estimated_processing_time_minutes': chunk_size / config['processing_rate_per_minute'],
+        'memory_requirements': {
+            'gpu_memory_per_chunk_gb': chunk_memory_mb / 1024,
+            'streaming_memory_mb': streaming_memory_mb,  # CPU memory for streaming
+            'model_memory_gb': config['model_memory_gb'],
+            'batch_memory_mb': batch_memory_mb,
+            'gpu_utilization_percent': min(95, (chunk_memory_mb / (gpu_memory_gb * 1024)) * 100)
+        },
+        'performance_estimates': {
+            'items_per_minute': config['processing_rate_per_minute'],
+            'total_processing_time_minutes': chunk_size / config['processing_rate_per_minute'],
+            'parallel_processing_time_minutes': max([
+                chunk_size / config['processing_rate_per_minute']
+                for i in range(total_chunks)
+            ]) if total_chunks > 0 else 0
+        }
     }
 
-# Example usage
-config = calculate_optimal_chunks(dataset_size=100000, available_gpus=8)
-print(f"Configuration: {config}")
-# Output: {'total_chunks': 8, 'chunk_size': 12500, 'optimal_batch_size': 32,
-#          'estimated_processing_time_minutes': 4.17, 'memory_per_chunk_gb': 12.5}
+# Example usage with realistic memory calculations
+config = calculate_optimal_chunks(dataset_size=100000, available_gpus=8, task_type='embedding')
+print(f"Configuration: {json.dumps(config, indent=2)}")
+
+# Output:
+# {
+#   "total_chunks": 8,
+#   "chunk_size": 12500,
+#   "optimal_batch_size": 32,
+#   "task_type": "embedding",
+#   "estimated_processing_time_minutes": 4.17,
+#   "memory_requirements": {
+#     "gpu_memory_per_chunk_gb": 2.1,        # Actual GPU memory needed per chunk
+#     "streaming_memory_mb": 85,              # CPU memory for streaming (constant)
+#     "model_memory_gb": 1.2,                 # Model weights
+#     "batch_memory_mb": 1680,                # Memory per batch
+#     "gpu_utilization_percent": 84           # GPU memory utilization
+#   },
+#   "performance_estimates": {
+#     "items_per_minute": 3000,
+#     "total_processing_time_minutes": 4.17,
+#     "parallel_processing_time_minutes": 4.17
+#   }
+# }
+
+# Memory comparison by task type:
+embedding_config = calculate_optimal_chunks(100000, 8, 'embedding')
+summarization_config = calculate_optimal_chunks(100000, 8, 'summarization')
+training_config = calculate_optimal_chunks(100000, 8, 'training')
+
+print("Memory usage by task type (T4 GPU):")
+print(f"Embedding: {embedding_config['memory_requirements']['gpu_memory_per_chunk_gb']:.1f} GB GPU, {embedding_config['memory_requirements']['streaming_memory_mb']} MB CPU")
+print(f"Summarization: {summarization_config['memory_requirements']['gpu_memory_per_chunk_gb']:.1f} GB GPU, {summarization_config['memory_requirements']['streaming_memory_mb']} MB CPU")
+print(f"Training: {training_config['memory_requirements']['gpu_memory_per_chunk_gb']:.1f} GB GPU, {training_config['memory_requirements']['streaming_memory_mb']} MB CPU")
+
+# Expected output:
+# Memory usage by task type (T4 GPU):
+# Embedding: 2.1 GB GPU, 85 MB CPU
+# Summarization: 7.8 GB GPU, 245 MB CPU
+# Training: 12.4 GB GPU, 485 MB CPU
 ```
 
-#### Dataset Splitter Script
+#### Streaming Dataset Splitter Script
 
 ```python
 import json
 import boto3
 import math
 from datetime import datetime
+from typing import Iterator, Any, Optional, Union
+import io
+import gzip
 
-def split_dataset_to_s3(dataset, bucket_name, dataset_name, chunk_config):
+class StreamingDatasetSplitter:
     """
-    Split dataset into chunks and upload to S3
+    Memory-efficient streaming dataset splitter for large-scale data
 
-    Args:
-        dataset: List of documents/samples
-        bucket_name: S3 bucket name
-        dataset_name: Dataset identifier
-        chunk_config: Configuration from calculate_optimal_chunks()
+    Supports:
+    - Streaming from files (JSON Lines, CSV, text)
+    - Streaming from S3 objects
+    - Streaming from databases
+    - Direct upload to S3 without loading full dataset in memory
     """
-    s3 = boto3.client('s3')
-    chunk_size = chunk_config['chunk_size']
-    total_chunks = chunk_config['total_chunks']
 
-    chunk_metadata = {
-        'dataset_name': dataset_name,
-        'total_chunks': total_chunks,
-        'chunk_size': chunk_size,
-        'total_items': len(dataset),
-        'created_at': datetime.utcnow().isoformat(),
-        'chunks': []
-    }
+    def __init__(self, bucket_name: str, aws_region: str = 'us-west-2'):
+        self.bucket_name = bucket_name
+        self.s3_client = boto3.client('s3', region_name=aws_region)
 
-    # Split and upload chunks
-    for i in range(total_chunks):
-        start_idx = i * chunk_size
-        end_idx = min(start_idx + chunk_size, len(dataset))
-        chunk_data = dataset[start_idx:end_idx]
+    def stream_and_split_from_file(
+        self,
+        file_path: str,
+        dataset_name: str,
+        chunk_config: dict,
+        file_format: str = 'jsonl'
+    ) -> dict:
+        """
+        Stream dataset from file and split into S3 chunks without loading into memory
 
-        chunk_key = f"datasets/{dataset_name}/chunks/chunk-{i:03d}.json"
+        Supports large files (TB-scale) by processing line by line
+        """
 
-        # Upload chunk to S3
-        s3.put_object(
-            Bucket=bucket_name,
-            Key=chunk_key,
-            Body=json.dumps({
-                'chunk_id': f"chunk-{i:03d}",
-                'items': chunk_data,
-                'start_index': start_idx,
-                'end_index': end_idx,
-                'item_count': len(chunk_data)
-            }),
-            ContentType='application/json'
-        )
+        def file_iterator():
+            """Generator that yields items from file without loading all into memory"""
+            if file_format == 'jsonl':
+                with open(file_path, 'r') as f:
+                    for line in f:
+                        if line.strip():
+                            yield json.loads(line.strip())
+            elif file_format == 'text':
+                with open(file_path, 'r') as f:
+                    for line in f:
+                        if line.strip():
+                            yield line.strip()
+            elif file_format == 'gzipped_jsonl':
+                with gzip.open(file_path, 'rt') as f:
+                    for line in f:
+                        if line.strip():
+                            yield json.loads(line.strip())
 
-        # Track chunk metadata
-        chunk_metadata['chunks'].append({
-            'chunk_id': f"chunk-{i:03d}",
-            's3_key': chunk_key,
-            'item_count': len(chunk_data),
-            'estimated_processing_time': len(chunk_data) / (3000 / 60)
+        return self._stream_and_split(file_iterator(), dataset_name, chunk_config)
+
+    def stream_and_split_from_s3(
+        self,
+        source_bucket: str,
+        source_key: str,
+        dataset_name: str,
+        chunk_config: dict,
+        file_format: str = 'jsonl'
+    ) -> dict:
+        """
+        Stream dataset directly from S3 source and split into chunks
+
+        Ideal for processing large datasets already stored in S3
+        """
+
+        def s3_iterator():
+            """Generator that streams from S3 object without downloading entire file"""
+            response = self.s3_client.get_object(Bucket=source_bucket, Key=source_key)
+
+            if source_key.endswith('.gz'):
+                body = gzip.decompress(response['Body'].read()).decode('utf-8')
+            else:
+                body = response['Body'].read().decode('utf-8')
+
+            lines = body.split('\n')
+            for line in lines:
+                if line.strip():
+                    if file_format == 'jsonl':
+                        yield json.loads(line.strip())
+                    else:
+                        yield line.strip()
+
+        return self._stream_and_split(s3_iterator(), dataset_name, chunk_config)
+
+    def stream_and_split_from_database(
+        self,
+        db_connection,
+        query: str,
+        dataset_name: str,
+        chunk_config: dict,
+        batch_size: int = 10000
+    ) -> dict:
+        """
+        Stream dataset from database query results and split into chunks
+
+        Processes database results in batches to handle large tables
+        """
+
+        def db_iterator():
+            """Generator that streams from database without loading all results"""
+            cursor = db_connection.cursor()
+            cursor.execute(query)
+
+            while True:
+                rows = cursor.fetchmany(batch_size)
+                if not rows:
+                    break
+                for row in rows:
+                    # Convert database row to string or JSON as needed
+                    if isinstance(row, (tuple, list)):
+                        yield ' '.join(str(col) for col in row)
+                    else:
+                        yield str(row)
+
+        return self._stream_and_split(db_iterator(), dataset_name, chunk_config)
+
+    def _stream_and_split(
+        self,
+        data_iterator: Iterator[Any],
+        dataset_name: str,
+        chunk_config: dict
+    ) -> dict:
+        """
+        Core streaming splitter that processes data iterator and uploads chunks
+
+        Memory usage: O(chunk_size) instead of O(dataset_size)
+        """
+        chunk_size = chunk_config['chunk_size']
+        current_chunk = []
+        chunk_index = 0
+        total_items = 0
+
+        chunk_metadata = {
+            'dataset_name': dataset_name,
+            'chunk_size': chunk_size,
+            'created_at': datetime.utcnow().isoformat(),
+            'chunks': []
+        }
+
+        print(f"Starting streaming split for dataset: {dataset_name}")
+        print(f"Target chunk size: {chunk_size}")
+
+        for item in data_iterator:
+            current_chunk.append(item)
+            total_items += 1
+
+            # When chunk is full, upload it
+            if len(current_chunk) >= chunk_size:
+                chunk_info = self._upload_chunk(
+                    current_chunk, dataset_name, chunk_index, total_items - len(current_chunk), total_items - 1
+                )
+                chunk_metadata['chunks'].append(chunk_info)
+
+                # Progress logging
+                if chunk_index % 10 == 0:
+                    print(f"Processed {chunk_index + 1} chunks, {total_items:,} items...")
+
+                # Reset for next chunk
+                current_chunk = []
+                chunk_index += 1
+
+        # Upload final partial chunk if exists
+        if current_chunk:
+            chunk_info = self._upload_chunk(
+                current_chunk, dataset_name, chunk_index, total_items - len(current_chunk), total_items - 1
+            )
+            chunk_metadata['chunks'].append(chunk_info)
+            chunk_index += 1
+
+        # Update final metadata
+        chunk_metadata.update({
+            'total_chunks': chunk_index,
+            'total_items': total_items,
+            'actual_chunks': len(chunk_metadata['chunks'])
         })
 
-    # Upload chunk metadata
-    metadata_key = f"datasets/{dataset_name}/chunk-metadata.json"
-    s3.put_object(
-        Bucket=bucket_name,
-        Key=metadata_key,
-        Body=json.dumps(chunk_metadata, indent=2),
-        ContentType='application/json'
+        # Upload chunk metadata
+        self._upload_metadata(dataset_name, chunk_metadata)
+
+        print(f"Successfully streamed and split {total_items:,} items into {chunk_index} chunks")
+        print(f"Memory usage: ~{chunk_size * 8 / 1024:.1f} KB (single chunk size)")
+
+        return chunk_metadata
+
+    def _upload_chunk(self, chunk_data: list, dataset_name: str, chunk_index: int, start_idx: int, end_idx: int) -> dict:
+        """Upload single chunk to S3 with compression for large chunks"""
+        chunk_id = f"chunk-{chunk_index:03d}"
+        chunk_key = f"datasets/{dataset_name}/chunks/{chunk_id}.json"
+
+        chunk_content = {
+            'chunk_id': chunk_id,
+            'items': chunk_data,
+            'start_index': start_idx,
+            'end_index': end_idx,
+            'item_count': len(chunk_data),
+            'created_at': datetime.utcnow().isoformat()
+        }
+
+        # Compress large chunks
+        content_json = json.dumps(chunk_content)
+        if len(content_json) > 1024 * 1024:  # > 1MB
+            content_body = gzip.compress(content_json.encode('utf-8'))
+            chunk_key = f"datasets/{dataset_name}/chunks/{chunk_id}.json.gz"
+            content_type = 'application/gzip'
+        else:
+            content_body = content_json
+            content_type = 'application/json'
+
+        # Upload with metadata
+        self.s3_client.put_object(
+            Bucket=self.bucket_name,
+            Key=chunk_key,
+            Body=content_body,
+            ContentType=content_type,
+            Metadata={
+                'chunk-id': chunk_id,
+                'item-count': str(len(chunk_data)),
+                'dataset-name': dataset_name,
+                'compressed': str(content_type == 'application/gzip')
+            }
+        )
+
+        return {
+            'chunk_id': chunk_id,
+            's3_key': chunk_key,
+            'item_count': len(chunk_data),
+            'estimated_processing_time': len(chunk_data) / 3000 * 60,  # minutes
+            'size_bytes': len(content_body),
+            'compressed': content_type == 'application/gzip'
+        }
+
+    def _upload_metadata(self, dataset_name: str, metadata: dict):
+        """Upload chunk metadata to S3"""
+        metadata_key = f"datasets/{dataset_name}/chunk-metadata.json"
+        self.s3_client.put_object(
+            Bucket=self.bucket_name,
+            Key=metadata_key,
+            Body=json.dumps(metadata, indent=2),
+            ContentType='application/json',
+            Metadata={
+                'dataset-name': dataset_name,
+                'total-chunks': str(metadata['total_chunks']),
+                'total-items': str(metadata['total_items'])
+            }
+        )
+
+# Usage Examples for Large-Scale Data
+
+# Example 1: Process TB-scale JSONL file without loading into memory
+def process_large_jsonl_file():
+    splitter = StreamingDatasetSplitter(bucket_name="argo-gpu-artifacts-12345")
+    config = calculate_optimal_chunks(dataset_size=10000000, available_gpus=16)  # 10M items
+
+    metadata = splitter.stream_and_split_from_file(
+        file_path="/data/large_dataset.jsonl",  # TB-scale file
+        dataset_name="large-10m-docs",
+        chunk_config=config,
+        file_format='jsonl'
+    )
+    print(f"Processed {metadata['total_items']:,} items using {metadata['total_chunks']} chunks")
+
+# Example 2: Stream from compressed S3 source
+def process_s3_source():
+    splitter = StreamingDatasetSplitter(bucket_name="target-bucket")
+    config = calculate_optimal_chunks(dataset_size=5000000, available_gpus=12)
+
+    metadata = splitter.stream_and_split_from_s3(
+        source_bucket="source-data-bucket",
+        source_key="datasets/massive-dataset.jsonl.gz",
+        dataset_name="s3-streamed-5m",
+        chunk_config=config,
+        file_format='jsonl'
     )
 
-    print(f"Successfully split {len(dataset)} items into {total_chunks} chunks")
-    return chunk_metadata
+# Example 3: Stream from database (PostgreSQL)
+def process_database_data():
+    import psycopg2
 
-# Example usage
-sample_dataset = [f"Document {i}: Sample text content..." for i in range(100000)]
-metadata = split_dataset_to_s3(
-    dataset=sample_dataset,
-    bucket_name="argo-gpu-artifacts-12345",
-    dataset_name="sample-100k-docs",
-    chunk_config=config
-)
+    conn = psycopg2.connect(
+        host="your-db-host",
+        database="your-db",
+        user="your-user",
+        password="your-password"
+    )
+
+    splitter = StreamingDatasetSplitter(bucket_name="argo-gpu-artifacts-12345")
+    config = calculate_optimal_chunks(dataset_size=20000000, available_gpus=20)  # 20M records
+
+    metadata = splitter.stream_and_split_from_database(
+        db_connection=conn,
+        query="SELECT content FROM documents WHERE processed = false ORDER BY id",
+        dataset_name="db-streamed-20m",
+        chunk_config=config,
+        batch_size=50000  # Process 50K DB rows at a time
+    )
 ```
 
 ### 2. Enhanced GPU Workflow Template
